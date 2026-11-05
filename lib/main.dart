@@ -1,5 +1,8 @@
+import 'dart:async';
 import 'dart:io';
 
+import 'package:app_links/app_links.dart';
+import 'package:content_resolver/content_resolver.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -36,7 +39,14 @@ class RecentDoc {
   final String path;
   int pageCount = 0;
   int lastPage = 1;
-  String get name => path.split(RegExp(r'[\\/]')).last;
+
+  String get name {
+    if (path.startsWith('content://')) {
+      final decodedPath = Uri.decodeFull(path);
+      return decodedPath.split(RegExp(r'[\/]')).last;
+    }
+    return path.split(RegExp(r'[\/]')).last;
+  }
 }
 
 // ---------------------------------------------------------------- Library
@@ -51,9 +61,49 @@ class LibraryScreen extends StatefulWidget {
 class _LibraryScreenState extends State<LibraryScreen> {
   final List<RecentDoc> _docs = [];
   String _query = '';
-  int _filter = 0; // visual only for now: Recent / Favorites / All files
+  int _filter = 0;
 
-  
+  late final AppLinks _appLinks;
+  StreamSubscription<Uri>? _linkSubscription;
+
+  @override
+  void initState() {
+    super.initState();
+    _initIncomingIntentListener();
+  }
+
+  @override
+  void dispose() {
+    _linkSubscription?.cancel();
+    super.dispose();
+  }
+
+  void _initIncomingIntentListener() {
+    _appLinks = AppLinks();
+
+    _linkSubscription = _appLinks.uriLinkStream.listen((Uri uri) {
+      _processIncomingPdfUri(uri);
+    }, onError: (err) {
+      debugPrint('Failed to handle incoming PDF intent: $err');
+    });
+  }
+
+  Future<void> _processIncomingPdfUri(Uri uri) async {
+    final rawPath = uri.toString();
+    if (rawPath.isEmpty) return;
+
+    var doc = _docs.where((d) => d.path == rawPath).firstOrNull;
+
+    if (doc == null) {
+      doc = RecentDoc(rawPath);
+      setState(() {
+        _docs.insert(0, doc!);
+      });
+    }
+
+    await _open(doc);
+  }
+
   Future<void> _pick() async {
     final files = await FilePicker.pickFiles(
       type: FileType.custom,
@@ -74,7 +124,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
 
     await _open(doc);
   }
-
 
   Future<void> _open(RecentDoc doc) async {
     await Navigator.push(
@@ -242,6 +291,42 @@ class _ReaderScreenState extends State<ReaderScreen> {
   late int _total = widget.doc.pageCount;
   bool _fullscreen = false;
 
+  Uint8List? _pdfBytes;
+  bool _isLoadingBytes = false;
+  String? _errorMessage;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadPdfData();
+  }
+
+  Future<void> _loadPdfData() async {
+    final path = widget.doc.path;
+    if (path.startsWith('content://')) {
+      setState(() {
+        _isLoadingBytes = true;
+        _errorMessage = null;
+      });
+      try {
+        final stream = await ContentResolver.resolveContentToStream(path);
+        final builder = BytesBuilder();
+        await for (final chunk in stream) {
+          builder.add(chunk);
+        }
+        setState(() {
+          _pdfBytes = builder.takeBytes();
+          _isLoadingBytes = false;
+        });
+      } catch (e) {
+        setState(() {
+          _errorMessage = "Failed to load system PDF file: $e";
+          _isLoadingBytes = false;
+        });
+      }
+    }
+  }
+
   void _setFullscreen(bool value) {
     setState(() => _fullscreen = value);
     SystemChrome.setEnabledSystemUIMode(
@@ -279,31 +364,41 @@ class _ReaderScreenState extends State<ReaderScreen> {
   @override
   Widget build(BuildContext context) {
     final marked = _bookmarks.contains(_page);
-    return PopScope(
-      canPop: !_fullscreen,
-      onPopInvokedWithResult: (didPop, _) {
-        if (!didPop) _setFullscreen(false);
-      },
-      child: Scaffold(
-      appBar: _fullscreen
-          ? null
-          : AppBar(
-              backgroundColor: Colors.white,
-              surfaceTintColor: Colors.white,
-              title: Text(widget.doc.name,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                      fontSize: 16, fontWeight: FontWeight.w600)),
-              actions: [
-                IconButton(
-                  tooltip: 'Full screen',
-                  icon: const Icon(Icons.fullscreen),
-                  onPressed: () => _setFullscreen(true),
-                ),
-              ],
-            ),
-      body: SfPdfViewer.file(
+    
+    Widget bodyWidget;
+    if (_isLoadingBytes) {
+      bodyWidget = const Center(child: CircularProgressIndicator());
+    } else if (_errorMessage != null) {
+      bodyWidget = Center(child: Padding(
+        padding: const EdgeInsets.all(16.0),
+        child: Text(_errorMessage!, style: const TextStyle(color: Colors.red)),
+      ));
+    } else if (widget.doc.path.startsWith('content://')) {
+      bodyWidget = _pdfBytes == null
+          ? const Center(child: Text("No data received"))
+          : SfPdfViewer.memory(
+              _pdfBytes!,
+              key: _viewerKey,
+              controller: _controller,
+              onTap: (details) {
+                if (_fullscreen) _setFullscreen(false);
+              },
+              onDocumentLoaded: (details) {
+                setState(() {
+                  _total = details.document.pages.count;
+                  widget.doc.pageCount = _total;
+                });
+                if (widget.doc.lastPage > 1) {
+                  _controller.jumpToPage(widget.doc.lastPage);
+                }
+              },
+              onPageChanged: (details) {
+                setState(() => _page = details.newPageNumber);
+                widget.doc.lastPage = details.newPageNumber;
+              },
+            );
+    } else {
+      bodyWidget = SfPdfViewer.file(
         File(widget.doc.path),
         key: _viewerKey,
         controller: _controller,
@@ -323,61 +418,89 @@ class _ReaderScreenState extends State<ReaderScreen> {
           setState(() => _page = details.newPageNumber);
           widget.doc.lastPage = details.newPageNumber;
         },
-      ),
-      bottomNavigationBar: _fullscreen ? null : Material(
-        color: Colors.white,
-        child: SafeArea(
-          child: Padding(
-            padding: const EdgeInsets.fromLTRB(20, 8, 20, 8),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Row(
-                  children: [
-                    Expanded(
-                      child: Slider(
-                        min: 1,
-                        max: _total > 1 ? _total.toDouble() : 2,
-                        divisions: _total > 1 ? _total - 1 : null,
-                        value: _page.clamp(1, _total > 1 ? _total : 2).toDouble(),
-                        activeColor: accent,
-                        onChanged: (v) => _controller.jumpToPage(v.round()),
+      );
+    }
+
+    return PopScope(
+      canPop: !_fullscreen,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop) _setFullscreen(false);
+      },
+      child: Scaffold(
+        appBar: _fullscreen
+            ? null
+            : AppBar(
+                backgroundColor: Colors.white,
+                surfaceTintColor: Colors.white,
+                title: Text(widget.doc.name,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                        fontSize: 16, fontWeight: FontWeight.w600)),
+                actions: [
+                  IconButton(
+                    tooltip: 'Full screen',
+                    icon: const Icon(Icons.fullscreen),
+                    onPressed: () => _setFullscreen(true),
+                  ),
+                ],
+              ),
+        body: bodyWidget,
+        bottomNavigationBar: _fullscreen ? null : Material(
+          color: Colors.white,
+          child: SafeArea(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(20, 8, 20, 8),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Slider(
+                          min: 1,
+                          max: _total > 1 ? _total.toDouble() : 2,
+                          divisions: _total > 1 ? _total - 1 : null,
+                          value: _page.clamp(1, _total > 1 ? _total : 2).toDouble(),
+                          activeColor: accent,
+                          onChanged: (v) => _controller.jumpToPage(v.round()),
+                        ),
                       ),
-                    ),
-                    Text('$_page / $_total',
-                        style: const TextStyle(
-                            fontSize: 14, fontWeight: FontWeight.w600)),
-                  ],
-                ),
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceAround,
-                  children: [
-                    _ToolButton(
-                        icon: Icons.search, label: 'Search', onTap: _search),
-                    _ToolButton(
-                        icon: Icons.format_list_bulleted,
-                        label: 'Contents',
-                        onTap: () =>
-                            _viewerKey.currentState?.openBookmarkView()),
-                    _ToolButton(
-                      icon: marked ? Icons.bookmark : Icons.bookmark_border,
-                      label: 'Bookmark',
-                      onTap: () => setState(() => marked
-                          ? _bookmarks.remove(_page)
-                          : _bookmarks.add(_page)),
-                    ),
-                    _ToolButton(
-                        icon: Icons.fit_screen,
-                        label: 'Fit width',
-                        onTap: () => _controller.zoomLevel = 1.0),
-                  ],
-                ),
-              ],
+                      Text('$_page / $_total',
+                          style: const TextStyle(
+                              fontSize: 14, fontWeight: FontWeight.w600)),
+                    ],
+                  ),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceAround,
+                    children: [
+                      _ToolButton(
+                          icon: Icons.search, label: 'Search', onTap: _search),
+                      _ToolButton(
+                          icon: Icons.format_list_bulleted,
+                          label: 'Contents',
+                          onTap: () =>
+                              _viewerKey.currentState?.openBookmarkView()),
+                      _ToolButton(
+                        icon: marked ? Icons.bookmark : Icons.bookmark_border,
+                        label: 'Bookmark',
+                        onTap: () => setState(() => marked
+                            ? _bookmarks.remove(_page)
+                            : _bookmarks.add(_page)),
+                      ),
+                      _ToolButton(
+                          icon: Icons.fit_screen,
+                          label: 'Fit width',
+                          onTap: () => _controller.zoomLevel = 1.0),
+                    ],
+                  ),
+                ],
+              ),
             ),
           ),
         ),
       ),
-    ));
+    );
   }
 }
 
