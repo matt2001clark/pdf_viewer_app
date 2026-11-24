@@ -292,6 +292,11 @@ class _ReaderScreenState extends State<ReaderScreen> {
   late int _total = widget.doc.pageCount;
   bool _fullscreen = false;
 
+  // In full screen, the scroll head hides after a period of no interaction.
+  static const _scrollHeadHideDelay = Duration(seconds: 2);
+  Timer? _scrollHeadTimer;
+  bool _scrollHeadVisible = true;
+
   Uint8List? _pdfBytes;
   bool _isLoadingBytes = false;
   String? _errorMessage;
@@ -329,14 +334,37 @@ class _ReaderScreenState extends State<ReaderScreen> {
   }
 
   void _setFullscreen(bool value) {
-    setState(() => _fullscreen = value);
+    setState(() {
+      _fullscreen = value;
+      _scrollHeadVisible = true;
+    });
+    if (value) {
+      _restartScrollHeadTimer();
+    } else {
+      _scrollHeadTimer?.cancel();
+    }
     SystemChrome.setEnabledSystemUIMode(
       value ? SystemUiMode.immersiveSticky : SystemUiMode.edgeToEdge,
     );
   }
 
+  /// Shows the scroll head and restarts the hide countdown (full screen only).
+  void _onUserInteraction() {
+    if (!_fullscreen) return;
+    if (!_scrollHeadVisible) setState(() => _scrollHeadVisible = true);
+    _restartScrollHeadTimer();
+  }
+
+  void _restartScrollHeadTimer() {
+    _scrollHeadTimer?.cancel();
+    _scrollHeadTimer = Timer(_scrollHeadHideDelay, () {
+      if (mounted && _fullscreen) setState(() => _scrollHeadVisible = false);
+    });
+  }
+
   @override
   void dispose() {
+    _scrollHeadTimer?.cancel();
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
     super.dispose();
   }
@@ -365,7 +393,8 @@ class _ReaderScreenState extends State<ReaderScreen> {
   @override
   Widget build(BuildContext context) {
     final marked = _bookmarks.contains(_page);
-    
+    final showScrollHead = !_fullscreen || _scrollHeadVisible;
+
     Widget bodyWidget;
     if (_isLoadingBytes) {
       bodyWidget = const Center(child: CircularProgressIndicator());
@@ -381,6 +410,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
               _pdfBytes!,
               key: _viewerKey,
               controller: _controller,
+              canShowScrollHead: showScrollHead,
               onTap: (details) {
                 if (_fullscreen) _setFullscreen(false);
               },
@@ -403,6 +433,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
         File(widget.doc.path),
         key: _viewerKey,
         controller: _controller,
+        canShowScrollHead: showScrollHead,
         onTap: (details) {
           if (_fullscreen) _setFullscreen(false);
         },
@@ -446,7 +477,12 @@ class _ReaderScreenState extends State<ReaderScreen> {
                   ),
                 ],
               ),
-        body: bodyWidget,
+        body: Listener(
+          onPointerDown: (_) => _onUserInteraction(),
+          onPointerMove: (_) => _onUserInteraction(),
+          onPointerSignal: (_) => _onUserInteraction(),
+          child: bodyWidget,
+        ),
         bottomNavigationBar: _fullscreen ? null : Material(
           color: Colors.white,
           child: SafeArea(
